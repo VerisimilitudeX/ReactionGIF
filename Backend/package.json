@@ -1,0 +1,16 @@
+{
+  "name": "reactiongif-backend",
+  "version": "1.0.0",
+  "description": "Key-holding proxy for the ReactionGIF iOS app (OpenAI + Tenor + Giphy).",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

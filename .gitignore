@@ -1,0 +1,28 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# Node backend
+Backend/node_modules/
+Backend/.env
+*.log
+
+# Secrets — fill in your real keys in Secrets.swift locally; it is NOT committed.
+# A committed template lives at Shared/Secrets.swift.example.
+Shared/Secrets.swift
