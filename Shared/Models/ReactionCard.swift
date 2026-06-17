@@ -6,6 +6,9 @@ struct ReactionCard: Identifiable {
     let id = UUID()
     let label: String
     let why: String
+    /// The query the AI chose for this bit — what actually gets sent to the GIF
+    /// providers. Kept around so feedback can capture it for diagnosis.
+    let searchQuery: String
     var candidates: [GifCandidate]
     var index: Int = 0
 

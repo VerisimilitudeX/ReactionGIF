@@ -1,10 +1,9 @@
 import Foundation
 import UIKit
 
-/// Drives the whole flow: screenshot -> AI plan -> GIF search -> shuffleable
-/// cards. Supports infinite loading: an initial batch shows fast, then more
-/// batches stream in as the user scrolls — guarded so we never fire overlapping
-/// requests or run past a hard cap.
+/// Drives the whole flow: screenshot(s) -> AI plan -> GIF search -> shuffleable
+/// cards. Returns a single batch of reactions (no infinite scroll); the model
+/// decides how many to return within the allowed range.
 @MainActor
 final class ReactionEngine: ObservableObject {
     enum Phase: Equatable {
@@ -18,97 +17,54 @@ final class ReactionEngine: ObservableObject {
     @Published var phase: Phase = .idle
     @Published var readBack: String = ""
     @Published var cards: [ReactionCard] = []
-    @Published var isLoadingMore: Bool = false
-    @Published var canLoadMore: Bool = false
 
-    /// Hard ceiling so accidental infinite scrolls can't drain API credit.
-    private let maxCards = 40
-    private let initialBatchSize = 6
-    private let nextBatchSize = 5
+    /// The model picks how many reactions to return within this range — only as
+    /// many as genuinely land. TODO: once enough feedback is collected, use the
+    /// thumbs up/down scoring to tune this range (and per-vibe sweet spots).
+    private let minResults = 5
+    private let maxResults = 10
 
-    /// Remembered so loadMore can re-issue the call with the same inputs.
-    private var lastImage: UIImage?
+    /// Remembered so feedback can capture the exact inputs behind a pick.
+    private var lastImages: [UIImage] = []
     private var lastVibe: Vibe = .auto
     private var lastSafeMode: Bool = false
 
     private let openAI = OpenAIService()
     private let gifs = GifProviders()
 
-    func generate(from image: UIImage, vibe: Vibe, safeMode: Bool) async {
-        lastImage = image
+    func generate(from images: [UIImage], vibe: Vibe, safeMode: Bool) async {
+        guard !images.isEmpty else { return }
+        lastImages = images
         lastVibe = vibe
         lastSafeMode = safeMode
 
         phase = .reading
         readBack = ""
         cards = []
-        canLoadMore = false
 
         do {
             let suggestion = try await openAI.suggestReactions(
-                for: image, vibe: vibe, safeMode: safeMode,
-                count: initialBatchSize, excludeLabels: []
+                for: images, vibe: vibe, safeMode: safeMode,
+                minCount: minResults, maxCount: maxResults
             )
             readBack = suggestion.readBack
             phase = .searching
 
-            let newCards = await buildCards(from: suggestion.options, usedTopURLs: [])
+            let (newCards, rateLimited) = await buildCards(from: suggestion.options, usedTopURLs: [])
             guard !newCards.isEmpty else {
-                phase = .failed("No GIFs found. Check your keys/backend or try a clearer screenshot.")
+                if rateLimited {
+                    phase = .failed("The GIF service is rate-limited right now. Wait a minute and try again (or add a Tenor key as a backup).")
+                } else {
+                    phase = .failed("No GIFs found. Try a clearer screenshot, or check your keys/backend.")
+                }
                 return
             }
 
             cards = newCards
             phase = .done
-            canLoadMore = cards.count < maxCards
             RecentsStore.shared.add(readBack: readBack, cards: newCards)
         } catch {
             phase = .failed(error.localizedDescription)
-        }
-    }
-
-    /// Ask the AI for the next batch of distinct bits. Safe to call repeatedly:
-    /// no-ops while one is in flight, while we're still on the initial load, or
-    /// once we've hit `maxCards`.
-    func loadMore() async {
-        guard let image = lastImage,
-              phase == .done,
-              !isLoadingMore,
-              canLoadMore,
-              cards.count < maxCards else { return }
-
-        isLoadingMore = true
-        defer { isLoadingMore = false }
-
-        let exclude = cards.map { $0.label }
-        let remaining = max(0, maxCards - cards.count)
-        let batch = min(nextBatchSize, remaining)
-        guard batch > 0 else {
-            canLoadMore = false
-            return
-        }
-
-        do {
-            let suggestion = try await openAI.suggestReactions(
-                for: image, vibe: lastVibe, safeMode: lastSafeMode,
-                count: batch, excludeLabels: exclude
-            )
-            let alreadyUsedURLs = Set(cards.compactMap { $0.current?.gifURL.absoluteString })
-            let newCards = await buildCards(
-                from: suggestion.options,
-                usedTopURLs: alreadyUsedURLs,
-                excludeLabels: Set(exclude)
-            )
-            if newCards.isEmpty {
-                // Model couldn't find anything new — stop asking.
-                canLoadMore = false
-                return
-            }
-            cards.append(contentsOf: newCards)
-            canLoadMore = cards.count < maxCards
-        } catch {
-            // Don't fail the whole screen for a paging error — just stop paging.
-            canLoadMore = false
         }
     }
 
@@ -136,20 +92,58 @@ final class ReactionEngine: ObservableObject {
         }
     }
 
+    /// Save a thumbs up/down for a card along with the full context behind the
+    /// pick (screenshots, AI read, search query, GIF, position). Patterns across
+    /// these entries are what reveal why results land or miss — exported in
+    /// Settings.
+    func recordFeedback(cardID: UUID, rating: FeedbackRating, reasons: [String]) {
+        guard let position = cards.firstIndex(where: { $0.id == cardID }) else { return }
+        let card = cards[position]
+        guard let gif = card.current else { return }
+
+        let entry = FeedbackEntry(
+            id: UUID(),
+            date: Date(),
+            rating: rating,
+            reasons: reasons,
+            vibe: lastVibe.rawValue,
+            safeMode: lastSafeMode,
+            readBack: readBack,
+            cardLabel: card.label,
+            cardWhy: card.why,
+            searchQuery: card.searchQuery,
+            position: position,
+            totalCards: cards.count,
+            gifProvider: gif.provider,
+            gifURL: gif.gifURL.absoluteString,
+            gifTitle: gif.title,
+            candidateIndex: card.index,
+            candidateCount: card.candidates.count,
+            imagesBase64: lastImages.compactMap { $0.downscaledJPEGBase64() }
+        )
+        FeedbackStore.shared.add(entry)
+    }
+
     // MARK: - Private
 
+    /// Builds cards for each option. Returns the cards plus whether any provider
+    /// reported a rate limit (so the caller can show an accurate message).
     private func buildCards(
         from options: [ReactionSuggestion.Option],
         usedTopURLs initialUsed: Set<String>,
         excludeLabels: Set<String> = []
-    ) async -> [ReactionCard] {
+    ) async -> (cards: [ReactionCard], rateLimited: Bool) {
         let reported = ReportStore.shared.reportedURLs
         var newCards: [ReactionCard] = []
         var usedTopURLs = initialUsed
+        var rateLimited = false
 
         for option in options {
             if excludeLabels.contains(option.label) { continue }
-            var pool = await gifs.search(option.searchQuery, safeMode: lastSafeMode)
+            let result = await gifs.search(option.searchQuery, safeMode: lastSafeMode)
+            if result.rateLimited { rateLimited = true }
+
+            var pool = result.candidates
             pool.removeAll { reported.contains($0.gifURL.absoluteString) }
 
             if let freshIndex = pool.firstIndex(where: { !usedTopURLs.contains($0.gifURL.absoluteString) }) {
@@ -158,8 +152,8 @@ final class ReactionEngine: ObservableObject {
             guard let top = pool.first else { continue }
             usedTopURLs.insert(top.gifURL.absoluteString)
 
-            newCards.append(ReactionCard(label: option.label, why: option.why, candidates: pool))
+            newCards.append(ReactionCard(label: option.label, why: option.why, searchQuery: option.searchQuery, candidates: pool))
         }
-        return newCards
+        return (newCards, rateLimited)
     }
 }

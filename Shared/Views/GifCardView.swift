@@ -1,13 +1,19 @@
 import SwiftUI
 
-/// One reaction card: animated GIF + why it lands + share / copy / shuffle / report.
+/// One reaction card: animated GIF + why it lands + share / copy / shuffle /
+/// report, plus a thumbs up/down so users can rate the pick.
 struct GifCardView: View {
     let card: ReactionCard
     var onShuffle: () -> Void
     var onReport: () -> Void
+    var onFeedback: (FeedbackRating, [String]) -> Void
 
     @State private var showShare = false
     @State private var toast: String?
+
+    @State private var rating: FeedbackRating?
+    @State private var showReasons = false
+    @State private var recordedDown = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -27,6 +33,10 @@ struct GifCardView: View {
                     .foregroundStyle(.secondary)
 
                 actionRow(gif: gif)
+
+                Divider()
+
+                feedbackRow
             }
         }
         .padding(14)
@@ -95,6 +105,52 @@ struct GifCardView: View {
         }
     }
 
+    /// Thumbs up/down. Down opens a short MCQ; up records immediately.
+    private var feedbackRow: some View {
+        HStack(spacing: 18) {
+            Text("Good pick?")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                vote(.up)
+            } label: {
+                Image(systemName: rating == .up ? "hand.thumbsup.fill" : "hand.thumbsup")
+            }
+            .tint(rating == .up ? .green : .secondary)
+
+            Button {
+                vote(.down)
+            } label: {
+                Image(systemName: rating == .down ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+            }
+            .tint(rating == .down ? .red : .secondary)
+        }
+        .font(.headline)
+        .buttonStyle(.plain)
+        .sheet(isPresented: $showReasons, onDismiss: {
+            // Opened the reasons sheet but didn't submit — undo the thumb.
+            if rating == .down && !recordedDown { rating = nil }
+        }) {
+            FeedbackReasonSheet { reasons in
+                recordedDown = true
+                onFeedback(.down, reasons)
+            }
+            .presentationDetents([.medium, .large])
+        }
+    }
+
+    private func vote(_ newRating: FeedbackRating) {
+        Haptics.tap()
+        rating = newRating
+        if newRating == .up {
+            onFeedback(.up, [])
+        } else {
+            recordedDown = false
+            showReasons = true
+        }
+    }
+
     @ViewBuilder
     private var toastView: some View {
         if let toast {
@@ -117,6 +173,65 @@ struct GifCardView: View {
             }
             try? await Task.sleep(nanoseconds: 1_400_000_000)
             await MainActor.run { withAnimation { toast = nil } }
+        }
+    }
+}
+
+/// Short MCQ shown after a thumbs-down: why didn't this pick land? Multi-select.
+struct FeedbackReasonSheet: View {
+    var onSubmit: ([String]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: Set<String> = []
+
+    private let reasons = [
+        "Doesn't match the conversation",
+        "Wrong vibe or tone",
+        "GIF unrelated to the search",
+        "Generic / overused",
+        "Not actually funny",
+        "Broken or low quality",
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(reasons, id: \.self) { reason in
+                        Button {
+                            if selected.contains(reason) {
+                                selected.remove(reason)
+                            } else {
+                                selected.insert(reason)
+                            }
+                        } label: {
+                            HStack {
+                                Text(reason).foregroundStyle(.primary)
+                                Spacer()
+                                if selected.contains(reason) {
+                                    Image(systemName: "checkmark").foregroundStyle(.tint)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("What was off?")
+                } footer: {
+                    Text("Pick all that apply. Saved with the screenshot and the GIF to help improve results.")
+                }
+            }
+            .navigationTitle("Why not?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Submit") {
+                        onSubmit(Array(selected))
+                        dismiss()
+                    }
+                }
+            }
         }
     }
 }

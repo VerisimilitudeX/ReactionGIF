@@ -2,27 +2,27 @@ import UIKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Principal class for the share extension. Pulls the shared image out of the
-/// extension context and hands it to a SwiftUI view that reuses the app's engine.
+/// Principal class for the share extension. Pulls the shared image(s) out of the
+/// extension context and hands them to a SwiftUI view that reuses the app's engine.
 final class ShareViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
 
-        loadSharedImage { [weak self] image in
+        loadSharedImages { [weak self] images in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if let image {
-                    self.present(image: image)
-                } else {
+                if images.isEmpty {
                     self.complete()
+                } else {
+                    self.present(images: images)
                 }
             }
         }
     }
 
-    private func present(image: UIImage) {
-        let root = ShareRootView(image: image) { [weak self] in self?.complete() }
+    private func present(images: [UIImage]) {
+        let root = ShareRootView(images: images) { [weak self] in self?.complete() }
         let host = UIHostingController(rootView: root)
         addChild(host)
         host.view.frame = view.bounds
@@ -35,19 +35,28 @@ final class ShareViewController: UIViewController {
         extensionContext?.completeRequest(returningItems: nil)
     }
 
-    private func loadSharedImage(completion: @escaping (UIImage?) -> Void) {
-        guard let item = extensionContext?.inputItems.first as? NSExtensionItem,
-              let providers = item.attachments else {
-            return completion(nil)
-        }
+    /// Loads every shared image attachment, preserving order.
+    private func loadSharedImages(completion: @escaping ([UIImage]) -> Void) {
         let imageType = UTType.image.identifier
-        for provider in providers where provider.hasItemConformingToTypeIdentifier(imageType) {
+        let providers = (extensionContext?.inputItems as? [NSExtensionItem])?
+            .compactMap { $0.attachments }
+            .flatMap { $0 }
+            .filter { $0.hasItemConformingToTypeIdentifier(imageType) } ?? []
+
+        guard !providers.isEmpty else { return completion([]) }
+
+        var results = [UIImage?](repeating: nil, count: providers.count)
+        let group = DispatchGroup()
+        for (index, provider) in providers.enumerated() {
+            group.enter()
             provider.loadItem(forTypeIdentifier: imageType, options: nil) { value, _ in
-                completion(Self.image(from: value))
+                results[index] = Self.image(from: value)
+                group.leave()
             }
-            return
         }
-        completion(nil)
+        group.notify(queue: .main) {
+            completion(results.compactMap { $0 })
+        }
     }
 
     private static func image(from value: Any?) -> UIImage? {
